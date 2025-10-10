@@ -1,35 +1,98 @@
 const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
 const cors = require("cors");
+const { Pool } = require("pg");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const multer = require("multer");
 
 const app = express();
-app.use(cors()); // cho phép kết nối từ frontend
+app.use(cors());
+app.use(express.json());
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*", // hoặc đổi thành URL frontend
-    methods: ["GET", "POST"]
+const SECRET_KEY = "YOUR_SECRET_KEY";
+
+// Upload avatar
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
+
+// PostgreSQL pool
+const pool = new Pool({
+  host: "192.168.20.14",
+  user: "xstore",
+  password: "xstore@kunder.info",
+  database: "xstore",
+  port: 3306,
+});
+
+// ==================== Register ====================
+app.post("/api/register", upload.single("avatar"), async (req, res) => {
+  const { full_name, nickname, birth_date, email, hometown, password } = req.body;
+  if (!full_name || !email || !password) return res.status(400).json({ error: "Missing fields" });
+
+  const hashed = await bcrypt.hash(password, 10);
+  const avatar_url = req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}` : null;
+
+  try {
+    await pool.query(
+      `INSERT INTO users (full_name, nickname, birth_date, email, hometown, avatar, password) 
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [full_name, nickname, birth_date, email, hometown, avatar_url, hashed]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.log(err);
+    res.status(400).json({ error: "Email already exists" });
   }
 });
+
+// ==================== Login ====================
+app.post("/api/login", async (req, res) => {
+  const { email, password } = req.body;
+  const result = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+  if (result.rows.length === 0) return res.status(400).json({ error: "User not found" });
+
+  const user = result.rows[0];
+  const match = await bcrypt.compare(password, user.password);
+  if (!match) return res.status(400).json({ error: "Wrong password" });
+
+  const token = jwt.sign({ id: user.id }, SECRET_KEY, { expiresIn: "7d" });
+  res.json({ success: true, token, user: { id: user.id, full_name: user.full_name, nickname: user.nickname, avatar: user.avatar } });
+});
+
+// ==================== Socket.IO ====================
+const http = require("http").createServer(app);
+const { Server } = require("socket.io");
+const io = new Server(http, { cors: { origin: "*", methods: ["GET","POST"] } });
+
+let onlineUsers = {}; // socketId => userId
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  socket.on("send-message", (data) => {
-    // gửi tin nhắn tới tất cả client khác
-    socket.broadcast.emit("receive-message", data);
+  socket.on("user-online", (userId) => {
+    onlineUsers[userId] = socket.id;
+    io.emit("online-users", Object.keys(onlineUsers));
+  });
+
+  socket.on("join-room", (roomId) => {
+    socket.join(`room-${roomId}`);
+  });
+
+  socket.on("send-message", async (data) => {
+    const { roomId, senderId, message } = data;
+    // Lưu vào database
+    await pool.query("INSERT INTO messages (room_id, sender_id, message) VALUES ($1,$2,$3)", [roomId, senderId, message]);
+    io.to(`room-${roomId}`).emit("receive-message", data);
   });
 
   socket.on("disconnect", () => {
+    for (let userId in onlineUsers) {
+      if (onlineUsers[userId] === socket.id) delete onlineUsers[userId];
+    }
+    io.emit("online-users", Object.keys(onlineUsers));
     console.log("User disconnected:", socket.id);
   });
 });
 
-app.get("/", (req, res) => {
-  res.send("Chat server is running");
-});
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+http.listen(PORT, () => console.log(`Server running on port ${PORT}`));
