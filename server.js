@@ -1,9 +1,9 @@
 const express = require("express");
 const cors = require("cors");
+const mysql = require("mysql2/promise");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const multer = require("multer");
-const { Pool } = require("pg");
 
 const app = express();
 app.use(cors());
@@ -15,31 +15,30 @@ const SECRET_KEY = "YOUR_SECRET_KEY";
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-// PostgreSQL pool
-const pool = new Pool({
-  host: "dpg-d3nmch49c44c73edcong-a.oregon-postgres.render.com",
-  user: "mychatdb_6dpv_user",
-  password: "9IH4M9jNVSSfISSuJSd6BphMk6WElcSr",
-  database: "mychatdb_6dpv",
-  port: 5432,
-  ssl: { rejectUnauthorized: false }, // Bắt buộc với Render
+// MySQL pool
+const pool = mysql.createPool({
+  host: "xstore.kunder.info", // IP server MySQL
+  user: "xstore",
+  password: "xstore@kunder.info",
+  database: "xstore",
+  port: 3306, // Port mặc định của MySQL
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
 });
 
 // ==================== Register ====================
 app.post("/api/register", upload.single("avatar"), async (req, res) => {
   const { full_name, nickname, birth_date, email, hometown, password } = req.body;
-  if (!full_name || !email || !password)
-    return res.status(400).json({ error: "Missing fields" });
+  if (!full_name || !email || !password) return res.status(400).json({ error: "Missing fields" });
 
   const hashed = await bcrypt.hash(password, 10);
-  const avatar_url = req.file
-    ? `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}`
-    : null;
+  const avatar_url = req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}` : null;
 
   try {
-    await pool.query(
-      `INSERT INTO users (full_name, nickname, birth_date, email, hometown, avatar, password)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    const [result] = await pool.execute(
+      `INSERT INTO users (full_name, nickname, birth_date, email, hometown, avatar, password) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [full_name, nickname, birth_date, email, hometown, avatar_url, hashed]
     );
     res.json({ success: true });
@@ -53,11 +52,10 @@ app.post("/api/register", upload.single("avatar"), async (req, res) => {
 app.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
   try {
-    const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
-    if (result.rows.length === 0)
-      return res.status(400).json({ error: "User not found" });
+    const [rows] = await pool.execute("SELECT * FROM users WHERE email = ?", [email]);
+    if (rows.length === 0) return res.status(400).json({ error: "User not found" });
 
-    const user = result.rows[0];
+    const user = rows[0];
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(400).json({ error: "Wrong password" });
 
@@ -100,8 +98,8 @@ io.on("connection", (socket) => {
   socket.on("send-message", async (data) => {
     const { roomId, senderId, message } = data;
     try {
-      await pool.query(
-        "INSERT INTO messages (room_id, sender_id, message) VALUES ($1, $2, $3)",
+      await pool.execute(
+        "INSERT INTO messages (room_id, sender_id, message) VALUES (?, ?, ?)",
         [roomId, senderId, message]
       );
       io.to(`room-${roomId}`).emit("receive-message", data);
@@ -119,12 +117,12 @@ io.on("connection", (socket) => {
   });
 });
 
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 3000;
 http.listen(PORT, async () => {
   try {
     await pool.query("SELECT 1");
-    console.log(`✅ Server running on port ${PORT} and connected to PostgreSQL`);
+    console.log(`✅ Server running on port ${PORT} and connected to MySQL`);
   } catch (err) {
-    console.error("❌ Database connection failed:", err);
+    console.error("❌ MySQL connection failed:", err);
   }
 });
