@@ -81,4 +81,50 @@ app.post("/api/login", async (req, res) => {
 // ==================== Socket.IO ====================
 const http = require("http").createServer(app);
 const { Server } = require("socket.io");
-const io = new Server(http, { cors: { origin: "*", methods: ["GE]()*
+const io = new Server(http, { cors: { origin: "*", methods: ["GET", "POST"] } });
+
+let onlineUsers = {}; // socketId => userId
+
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
+
+  socket.on("user-online", (userId) => {
+    onlineUsers[userId] = socket.id;
+    io.emit("online-users", Object.keys(onlineUsers));
+  });
+
+  socket.on("join-room", (roomId) => {
+    socket.join(`room-${roomId}`);
+  });
+
+  socket.on("send-message", async (data) => {
+    const { roomId, senderId, message } = data;
+    try {
+      await pool.query(
+        "INSERT INTO messages (room_id, sender_id, message) VALUES ($1, $2, $3)",
+        [roomId, senderId, message]
+      );
+      io.to(`room-${roomId}`).emit("receive-message", data);
+    } catch (err) {
+      console.error("Message insert failed:", err);
+    }
+  });
+
+  socket.on("disconnect", () => {
+    for (let userId in onlineUsers) {
+      if (onlineUsers[userId] === socket.id) delete onlineUsers[userId];
+    }
+    io.emit("online-users", Object.keys(onlineUsers));
+    console.log("User disconnected:", socket.id);
+  });
+});
+
+const PORT = process.env.PORT;
+http.listen(PORT, async () => {
+  try {
+    await pool.query("SELECT 1");
+    console.log(`✅ Server running on port ${PORT} and connected to PostgreSQL`);
+  } catch (err) {
+    console.error("❌ Database connection failed:", err);
+  }
+});
