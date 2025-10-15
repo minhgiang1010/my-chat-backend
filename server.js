@@ -17,11 +17,11 @@ const upload = multer({ storage });
 
 // MySQL pool
 const pool = mysql.createPool({
-  host: "192.168.20.14", // IP server MySQL
-  user: "xstore",
-  password: "xstore@kunder.info",
-  database: "xstore",
-  port: 3306, // Port mặc định của MySQL
+  host: "dpg-d3nmch49c44c73edcong-a", // IP server MySQL
+  user: "mychatdb_6dpv_user",
+  password: "9IH4M9jNVSSfISSuJSd6BphMk6WElcSr",
+  database: "mychatdb_6dpv",
+  port: 5432, // Port mặc định của MySQL
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
