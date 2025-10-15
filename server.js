@@ -17,7 +17,7 @@ const upload = multer({ storage });
 
 // MySQL pool
 const pool = mysql.createPool({
-  host: "dpg-d3nmch49c44c73edcong-a", // IP server MySQL
+  host: "dpg-d3nmch49c44c73edcong-a.render.com", // IP server MySQL
   user: "mychatdb_6dpv_user",
   password: "9IH4M9jNVSSfISSuJSd6BphMk6WElcSr",
   database: "mychatdb_6dpv",
