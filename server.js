@@ -1,128 +1,130 @@
-const express = require("express");
-const cors = require("cors");
-const mysql = require("mysql2/promise");
-const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
-const multer = require("multer");
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+import cors from 'cors';
+import dotenv from 'dotenv';
 
+import { pool } from './config/db.js'; // MySQL pool
+import userRoutes from './routes/users.js';
+import messageRoutes from './routes/messages.js';
+
+dotenv.config();
 const app = express();
+const server = http.createServer(app);
+
+// Khởi tạo Socket.IO server và cấu hình CORS
+export const io = new Server(server, {cors: {origin: '*'}});
+
 app.use(cors());
 app.use(express.json());
 
-const SECRET_KEY = "YOUR_SECRET_KEY";
-
-// Upload avatar
-const storage = multer.memoryStorage();
-const upload = multer({ storage });
-
-// MySQL pool
-const pool = mysql.createPool({
-  host: "xstore.kunder.info", // IP server MySQL
-  user: "xstore",
-  password: "xstore@kunder.info",
-  database: "xstore",
-  port: 3306, // Port mặc định của MySQL
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
+// Middleware: Gắn đối tượng io vào req để có thể sử dụng trong các controller API
+app.use((req, res, next) => {
+    req.io = io;
+    next();
 });
 
-// ==================== Register ====================
-app.post("/api/register", upload.single("avatar"), async (req, res) => {
-  const { full_name, nickname, birth_date, email, hometown, password } = req.body;
-  if (!full_name || !email || !password) return res.status(400).json({ error: "Missing fields" });
+// API routes
+app.use('/api/users', userRoutes);
+app.use('/api/messages', messageRoutes);
 
-  const hashed = await bcrypt.hash(password, 10);
-  const avatar_url = req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}` : null;
+// ========================
+// LOGIC QUẢN LÝ SOCKET & ONLINE STATUS
+// ========================
+// Map lưu trữ số lượng kết nối (socket) hiện tại của mỗi User. Key: userId, Value: count
+const userConnections = new Map();
 
-  try {
-    const [result] = await pool.execute(
-      `INSERT INTO users (full_name, nickname, birth_date, email, hometown, avatar, password) 
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [full_name, nickname, birth_date, email, hometown, avatar_url, hashed]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: "Email already exists or query failed" });
-  }
-});
+io.on('connection', (socket) => {
+    console.log('Socket connected:', socket.id);
 
-// ==================== Login ====================
-app.post("/api/login", async (req, res) => {
-  const { email, password } = req.body;
-  try {
-    const [rows] = await pool.execute("SELECT * FROM users WHERE email = ?", [email]);
-    if (rows.length === 0) return res.status(400).json({ error: "User not found" });
+    // --- user join socket + set online ---
+    socket.on('join', async (userId) => {
+        socket.userId = userId; // lưu userId trên socket
+        socket.join(`user_${userId}`);
+        console.log(`User ${userId} joined socket room`);
 
-    const user = rows[0];
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(400).json({ error: "Wrong password" });
+        // Cập nhật số lượng kết nối
+        const currentCount = userConnections.get(Number(userId)) || 0;
+        userConnections.set(Number(userId), currentCount + 1);
 
-    const token = jwt.sign({ id: user.id }, SECRET_KEY, { expiresIn: "7d" });
-    res.json({
-      success: true,
-      token,
-      user: {
-        id: user.id,
-        full_name: user.full_name,
-        nickname: user.nickname,
-        avatar: user.avatar,
-      },
+        // Chỉ update DB và emit khi người dùng chuyển từ OFFLINE (0 kết nối) sang ONLINE (1 kết nối)
+        if (currentCount === 0) {
+            try {
+                await pool.query('UPDATE users SET isOnline=1 WHERE id=?', [userId]);
+                io.emit('userStatusChange', {id: Number(userId), isOnline: true});
+                console.log(`User ${userId} set ONLINE in DB.`);
+            } catch (err) {
+                console.error('Set user online error:', err);
+            }
+        }
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Login failed" });
-  }
+
+    // --- join chat room ---
+    socket.on('joinRoom', (roomId) => {
+        socket.join(`room_${roomId}`);
+        console.log(`Socket ${socket.id} joined room_${roomId}`);
+    });
+
+    // --- send message ---
+    socket.on('send_message', async (msg) => {
+        try {
+            const [insert] = await pool.query(
+                    'INSERT INTO messages (room_id, sender_id, message) VALUES (?, ?, ?)',
+                    [msg.room_id, msg.sender_id, msg.message]
+                    );
+
+            // Thêm ID và timestamp (hoặc lấy từ DB nếu muốn chính xác hơn)
+            msg.id = insert.insertId;
+            msg.created_at = new Date();
+
+            // 2️⃣ Lấy danh sách thành viên trong phòng
+            const [members] = await pool.query(
+                    'SELECT user_id FROM room_members WHERE room_id = ?',
+                    [msg.room_id]
+                    );
+
+            // Phát tin nhắn đến tất cả socket trong phòng
+            io.to(`room_${msg.room_id}`).emit('receive_message', msg);
+            
+            // 4️⃣ Gửi cập nhật chatlist tới TẤT CẢ thành viên (trừ sender)
+            for (const member of members) {
+                    io.to(`user_${member.user_id}`).emit('update_chatlist', msg);
+                    console.log('update_chatlist: '+ member.user_id);
+            }
+        } catch (err) {
+            console.error('Error sending and saving message:', err);
+            // Có thể emit lỗi ngược lại cho client
+            socket.emit('message_error', {error: 'Failed to send message.'});
+        }
+    });
+
+    // --- disconnect / set offline ---
+    socket.on('disconnect', async () => {
+        console.log('Socket disconnected:', socket.id);
+        if (socket.userId) {
+            const userId = Number(socket.userId);
+            const currentCount = userConnections.get(userId) || 1;
+            const newCount = currentCount - 1;
+
+            userConnections.set(userId, newCount);
+
+            // Chỉ update DB và emit khi người dùng về 0 kết nối
+            if (newCount <= 0) {
+                userConnections.delete(userId); // Xóa khỏi Map
+                try {
+                    await pool.query('UPDATE users SET isOnline=0 WHERE id=?', [userId]);
+                    io.emit('userStatusChange', {id: userId, isOnline: false});
+                    console.log(`User ${userId} set OFFLINE in DB.`);
+                } catch (err) {
+                    console.error('Set user offline error:', err);
+                }
+            }
+        }
+    });
 });
 
-// ==================== Socket.IO ====================
-const http = require("http").createServer(app);
-const { Server } = require("socket.io");
-const io = new Server(http, { cors: { origin: "*", methods: ["GET", "POST"] } });
-
-let onlineUsers = {}; // socketId => userId
-
-io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
-
-  socket.on("user-online", (userId) => {
-    onlineUsers[userId] = socket.id;
-    io.emit("online-users", Object.keys(onlineUsers));
-  });
-
-  socket.on("join-room", (roomId) => {
-    socket.join(`room-${roomId}`);
-  });
-
-  socket.on("send-message", async (data) => {
-    const { roomId, senderId, message } = data;
-    try {
-      await pool.execute(
-        "INSERT INTO messages (room_id, sender_id, message) VALUES (?, ?, ?)",
-        [roomId, senderId, message]
-      );
-      io.to(`room-${roomId}`).emit("receive-message", data);
-    } catch (err) {
-      console.error("Message insert failed:", err);
-    }
-  });
-
-  socket.on("disconnect", () => {
-    for (let userId in onlineUsers) {
-      if (onlineUsers[userId] === socket.id) delete onlineUsers[userId];
-    }
-    io.emit("online-users", Object.keys(onlineUsers));
-    console.log("User disconnected:", socket.id);
-  });
-});
-
+// ========================
+// START SERVER
+// ========================
 const PORT = process.env.PORT || 3000;
-http.listen(PORT, async () => {
-  try {
-    await pool.query("SELECT 1");
-    console.log(`✅ Server running on port ${PORT} and connected to MySQL`);
-  } catch (err) {
-    console.error("❌ MySQL connection failed:", err);
-  }
-});
+server.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));
